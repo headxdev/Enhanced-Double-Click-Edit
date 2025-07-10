@@ -1,8 +1,8 @@
 /**
  * @name Enhanced Double Click To Edit
  * @author headxdev
- * @version 1.1.0
- * @description Doppelklick auf eine Nachricht, um sie lokal zu bearbeiten (nur für dich sichtbar). Eigene Nachrichten können wie gewohnt bearbeitet werden.
+ * @version 1.2.0
+ * @description Doppelklick auf eigene Nachrichten zum Bearbeiten. Optional: Doppelklick auf fremde zum Antworten, Rechtsklick auf fremde zum lokalen Bearbeiten.
  * @source https://github.com/headxdev/Enhanced-Double-Click-Edit/blob/main/EnhancedDoubleClickEdit.plugin.js
  */
 
@@ -11,15 +11,12 @@ const { React, Webpack, Data, Utils, ReactUtils } = BdApi;
 const config = {};
 
 const DEFAULTS = {
-    doubleClickToEditModifier: false,
-    editModifier: "shift",
     doubleClickToReply: false,
     doubleClickToReplyModifier: false,
     replyModifier: "shift",
-    doubleClickToCopy: false,
-    copyModifier: "shift",
-    enableLocalEdit: true,
-    localEditModifier: "alt"
+    enableRightClickEdit: false,
+    rightClickEditModifier: false,
+    rightClickModifier: "ctrl"
 };
 
 const IGNORE_CLASSES = ["video", "emoji", "content", "reactionInner"];
@@ -35,14 +32,87 @@ module.exports = class EnhancedDoubleClickEdit {
     start() {
         try {
             // Module-Refs
-            this.selectedClass = Webpack.getModule(Webpack.Filters.byKeys("message", "selected")).selected;
-            this.messagesWrapper = Webpack.getModule(Webpack.Filters.byKeys("empty", "messagesWrapper")).messagesWrapper;
-            this.copyToClipboard = Webpack.getModule(Webpack.Filters.byKeys("clipboard", "app")).clipboard.copy;
+            this.selectedClass = Webpack.getModule(Webpack.Filters.byKeys("message", "selected"))?.selected;
+            this.messagesWrapper = Webpack.getModule(Webpack.Filters.byKeys("empty", "messagesWrapper"))?.messagesWrapper;
             this.replyToMessage = Webpack.getModule(m => m?.toString?.()?.replace('\n', '')?.search(/(channel:e,message:n,shouldMention:!)/) > -1, { searchExports: true });
-            this.getChannel = Webpack.getModule(Webpack.Filters.byKeys("getChannel", "getDMFromUserId")).getChannel;
+            this.getChannel = Webpack.getModule(Webpack.Filters.byKeys("getChannel", "getDMFromUserId"))?.getChannel;
             this.MessageStore = Webpack.getModule(Webpack.Filters.byKeys("receiveMessage", "editMessage"));
             this.CurrentUserStore = Webpack.getModule(Webpack.Filters.byKeys("getCurrentUser"));
-            this.UIModule = Webpack.getModule(m => m.FormItem && m.RadioGroup);
+            
+            // Sichere UI-Modul-Suche
+            this.UIModule = Webpack.getModule(m => m?.FormItem && m?.RadioGroup) || 
+                           Webpack.getModule(m => m?.FormSwitch) || 
+                           Webpack.getModule(Webpack.Filters.byKeys("FormItem", "RadioGroup"));
+
+            // Fallback für UI-Komponenten
+            if (!this.UIModule) {
+                this.UIModule = {
+                    FormSwitch: React.forwardRef((props, ref) => {
+                        return React.createElement('div', {
+                            style: { display: 'flex', alignItems: 'center', marginBottom: '16px' }
+                        }, [
+                            React.createElement('input', {
+                                key: 'input',
+                                type: 'checkbox',
+                                checked: props.value,
+                                onChange: (e) => props.onChange(e.target.checked),
+                                style: { marginRight: '8px' }
+                            }),
+                            React.createElement('label', {
+                                key: 'label',
+                                style: { color: '#fff', fontSize: '14px' }
+                            }, props.children),
+                            props.note && React.createElement('div', {
+                                key: 'note',
+                                style: { fontSize: '12px', color: '#b9bbbe', marginLeft: '8px' }
+                            }, props.note)
+                        ]);
+                    }),
+                    FormItem: React.forwardRef((props, ref) => {
+                        return React.createElement('div', {
+                            style: { 
+                                marginBottom: '16px', 
+                                opacity: props.disabled ? 0.5 : 1 
+                            }
+                        }, [
+                            props.title && React.createElement('h4', {
+                                key: 'title',
+                                style: { color: '#fff', marginBottom: '8px', fontSize: '14px' }
+                            }, props.title),
+                            props.children
+                        ]);
+                    }),
+                    RadioGroup: React.forwardRef((props, ref) => {
+                        return React.createElement('div', {
+                            style: { display: 'flex', flexDirection: 'column', gap: '8px' }
+                        }, props.options?.map((option, index) => 
+                            React.createElement('label', {
+                                key: index,
+                                style: { 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    color: '#fff',
+                                    fontSize: '14px',
+                                    opacity: props.disabled ? 0.5 : 1,
+                                    cursor: props.disabled ? 'not-allowed' : 'pointer'
+                                }
+                            }, [
+                                React.createElement('input', {
+                                    key: 'radio',
+                                    type: 'radio',
+                                    name: `radio-${Math.random()}`,
+                                    value: option.value,
+                                    checked: props.value === option.value,
+                                    onChange: () => !props.disabled && props.onChange({ value: option.value }),
+                                    disabled: props.disabled,
+                                    style: { marginRight: '8px' }
+                                }),
+                                option.name
+                            ])
+                        ));
+                    })
+                };
+            }
 
             // Einstellungen laden
             this.loadSettings();
@@ -50,6 +120,7 @@ module.exports = class EnhancedDoubleClickEdit {
 
             // Event-Listener
             document.addEventListener("dblclick", this.handleDoubleClick);
+            document.addEventListener("contextmenu", this.handleRightClick);
             setTimeout(() => this.applyLocalEdits(), 1000);
         } catch (err) {
             console.error("Fehler beim Start:", err);
@@ -59,6 +130,7 @@ module.exports = class EnhancedDoubleClickEdit {
 
     stop() {
         document.removeEventListener("dblclick", this.handleDoubleClick);
+        document.removeEventListener("contextmenu", this.handleRightClick);
         this.saveLocalEdits();
     }
 
@@ -116,30 +188,64 @@ module.exports = class EnhancedDoubleClickEdit {
         const instance = ReactUtils.getInternalInstance(messageDiv);
         if (!instance) return;
 
-        if (this._settings.doubleClickToCopy && this.checkForModifier(this._settings.copyModifier, e))
-            this.copyToClipboard(document.getSelection().toString());
+        const message = Utils.findInTree(instance, m => m?.baseMessage, { walkable: WALKABLE })?.baseMessage
+            ?? Utils.findInTree(instance, m => m?.message, { walkable: WALKABLE })?.message;
+        if (!message) return;
+
+        const currentUser = this.CurrentUserStore?.getCurrentUser();
+        if (!currentUser) return;
+
+        const isOwn = message.author.id === currentUser.id;
+
+        // Eigene Nachricht bearbeiten (immer aktiv)
+        if (isOwn) {
+            this.MessageStore?.startEditMessage?.(message.channel_id, message.id, message.content);
+            return;
+        }
+
+        // Fremde Nachricht: Antworten (optional)
+        if (!isOwn && this._settings.doubleClickToReply) {
+            if (!this._settings.doubleClickToReplyModifier || this.checkForModifier(this._settings.replyModifier, e)) {
+                const channel = this.getChannel?.(message.channel_id);
+                if (channel) {
+                    this.replyToMessage?.(channel, message, e);
+                }
+                return;
+            }
+        }
+    };
+
+    /* Rechtsklick-Handler */
+    handleRightClick = (e) => {
+        if (!this._settings.enableRightClickEdit) return;
+
+        if (typeof e?.target?.className !== "string" ||
+            IGNORE_CLASSES.some(cls => e.target.className?.includes(cls))) return;
+
+        const messageDiv = e.target.closest('li > [class^=message]');
+        if (!messageDiv || messageDiv.classList.contains(this.selectedClass)) return;
+
+        const instance = ReactUtils.getInternalInstance(messageDiv);
+        if (!instance) return;
 
         const message = Utils.findInTree(instance, m => m?.baseMessage, { walkable: WALKABLE })?.baseMessage
             ?? Utils.findInTree(instance, m => m?.message, { walkable: WALKABLE })?.message;
         if (!message) return;
 
-        const isOwn = message.author.id === this.CurrentUserStore.getCurrentUser().id;
+        const currentUser = this.CurrentUserStore?.getCurrentUser();
+        if (!currentUser) return;
 
-        // Lokale Bearbeitung für alle Nachrichten
-        if (this._settings.enableLocalEdit && this.checkForModifier(this._settings.localEditModifier, e)) {
-            const currentContent = this.localEdits.get(message.id) || message.content;
-            this.openLocalEditModal(message, currentContent);
-            return;
-        }
-        // Eigene Nachricht normal bearbeiten
-        if (isOwn && (!this._settings.doubleClickToEditModifier || this.checkForModifier(this._settings.editModifier, e))) {
-            this.MessageStore.startEditMessage(message.channel_id, message.id, message.content);
-            return;
-        }
-        // Antworten auf andere Nachricht
-        if (!isOwn && this._settings.doubleClickToReply && (!this._settings.doubleClickToReplyModifier || this.checkForModifier(this._settings.replyModifier, e))) {
-            this.replyToMessage(this.getChannel(message.channel_id), message, e);
-            return;
+        const isOwn = message.author.id === currentUser.id;
+
+        // Nur für fremde Nachrichten
+        if (!isOwn) {
+            if (!this._settings.rightClickEditModifier || this.checkForModifier(this._settings.rightClickModifier, e)) {
+                e.preventDefault();
+                e.stopPropagation();
+                const currentContent = this.localEdits.get(message.id) || message.content;
+                this.openLocalEditModal(message, currentContent);
+                return;
+            }
         }
     };
 
@@ -159,18 +265,17 @@ module.exports = class EnhancedDoubleClickEdit {
 
         const title = document.createElement('h3');
         title.innerText = "Nachricht lokal bearbeiten";
-        title.style.margin = 0;
+        title.style.margin = '0';
 
         const subtitle = document.createElement('div');
         subtitle.innerText = "Diese Änderung ist nur für dich sichtbar und lokal gespeichert.";
-        subtitle.style.fontSize = "13px";
-        subtitle.style.color = "#b9bbbe";
+        subtitle.style.cssText = "font-size:13px; color:#b9bbbe;";
 
         const textarea = document.createElement('textarea');
         textarea.value = currentContent;
         textarea.style.cssText = `
             width:100%; height:100px; background:#40444b; color:#fff; border:1px solid #202225; border-radius:4px;
-            padding:10px; resize:vertical; font-family:inherit; font-size:15px;`;
+            padding:10px; resize:vertical; font-family:inherit; font-size:15px; box-sizing:border-box;`;
 
         const btnRow = document.createElement('div');
         btnRow.style.cssText = "display:flex; gap:12px; justify-content:flex-end;";
@@ -233,93 +338,140 @@ module.exports = class EnhancedDoubleClickEdit {
     getSettingsPanel() {
         return () => {
             const [settings, setSettings] = React.useState({ ...this._settings });
+            
             const handleSwitch = (key) => value => {
                 this.saveSetting(key, value);
                 setSettings(s => ({ ...s, [key]: value }));
             };
+            
             const handleRadio = (key) => ({ value }) => {
                 this.saveSetting(key, value);
                 setSettings(s => ({ ...s, [key]: value }));
             };
+
+            // Sicherstellen, dass UIModule existiert
+            if (!this.UIModule) {
+                return React.createElement('div', { 
+                    style: { color: '#fff', padding: '16px' } 
+                }, 'Fehler: UI-Module konnten nicht geladen werden.');
+            }
+
             return React.createElement(React.Fragment, {},
-                React.createElement(this.UIModule.FormSwitch, {
-                    value: settings.doubleClickToEditModifier,
-                    note: "Doppelklick-Bearbeitung eigener Nachrichten nur mit Modifikator",
-                    onChange: handleSwitch("doubleClickToEditModifier")
-                }, "Bearbeiten-Modifikator aktivieren"),
-                React.createElement(this.UIModule.FormItem, {
-                    disabled: !settings.doubleClickToEditModifier,
-                    title: "Modifikator für eigene Nachrichten bearbeiten"
-                }, React.createElement(this.UIModule.RadioGroup, {
-                    disabled: !settings.doubleClickToEditModifier,
-                    value: settings.editModifier,
-                    options: [
-                        { name: "Shift", value: "shift" },
-                        { name: "Ctrl", value: "ctrl" },
-                        { name: "Alt", value: "alt" }
-                    ],
-                    onChange: handleRadio("editModifier")
-                })),
-                React.createElement(this.UIModule.FormSwitch, {
-                    value: settings.enableLocalEdit,
-                    note: "Erlaube lokale Bearbeitung aller Nachrichten (nur für dich sichtbar)",
-                    onChange: handleSwitch("enableLocalEdit")
-                }, "Lokale Bearbeitung aktivieren"),
-                React.createElement(this.UIModule.FormItem, {
-                    disabled: !settings.enableLocalEdit,
-                    title: "Modifikator für lokale Bearbeitung"
-                }, React.createElement(this.UIModule.RadioGroup, {
-                    disabled: !settings.enableLocalEdit,
-                    value: settings.localEditModifier,
-                    options: [
-                        { name: "Shift", value: "shift" },
-                        { name: "Ctrl", value: "ctrl" },
-                        { name: "Alt", value: "alt" }
-                    ],
-                    onChange: handleRadio("localEditModifier")
-                })),
-                React.createElement(this.UIModule.FormSwitch, {
-                    value: settings.doubleClickToReply,
-                    note: "Doppelklick auf fremde Nachrichten zum Antworten",
-                    onChange: handleSwitch("doubleClickToReply")
-                }, "Antworten aktivieren"),
-                React.createElement(this.UIModule.FormSwitch, {
-                    disabled: !settings.doubleClickToReply,
-                    value: settings.doubleClickToReplyModifier,
-                    note: "Antworten nur mit Modifikator",
-                    onChange: handleSwitch("doubleClickToReplyModifier")
-                }, "Antworten-Modifikator aktivieren"),
-                React.createElement(this.UIModule.FormItem, {
-                    disabled: !settings.doubleClickToReply || !settings.doubleClickToReplyModifier,
-                    title: "Modifikator zum Antworten auf Nachrichten"
-                }, React.createElement(this.UIModule.RadioGroup, {
-                    disabled: !settings.doubleClickToReply || !settings.doubleClickToReplyModifier,
-                    value: settings.replyModifier,
-                    options: [
-                        { name: "Shift", value: "shift" },
-                        { name: "Ctrl", value: "ctrl" },
-                        { name: "Alt", value: "alt" }
-                    ],
-                    onChange: handleRadio("replyModifier")
-                })),
-                React.createElement(this.UIModule.FormSwitch, {
-                    value: settings.doubleClickToCopy,
-                    note: "Kopiert Auswahl vor Bearbeiten",
-                    onChange: handleSwitch("doubleClickToCopy")
-                }, "Kopieren aktivieren"),
-                React.createElement(this.UIModule.FormItem, {
-                    disabled: !settings.doubleClickToCopy,
-                    title: "Modifikator zum Kopieren"
-                }, React.createElement(this.UIModule.RadioGroup, {
-                    disabled: !settings.doubleClickToCopy,
-                    value: settings.copyModifier,
-                    options: [
-                        { name: "Shift", value: "shift" },
-                        { name: "Ctrl", value: "ctrl" },
-                        { name: "Alt", value: "alt" }
-                    ],
-                    onChange: handleRadio("copyModifier")
-                })),
+                // Info-Bereich
+                React.createElement('div', {
+                    style: { 
+                        background: '#2f3136', 
+                        padding: '12px', 
+                        borderRadius: '6px', 
+                        marginBottom: '20px',
+                        color: '#b9bbbe',
+                        fontSize: '13px'
+                    }
+                }, [
+                    React.createElement('div', { 
+                        key: 'info1',
+                        style: { marginBottom: '8px' }
+                    }, '📝 Doppelklick auf EIGENE Nachrichten = Immer bearbeiten'),
+                    React.createElement('div', { 
+                        key: 'info2',
+                        style: { marginBottom: '8px' }
+                    }, '💬 Doppelklick auf FREMDE Nachrichten = Optional antworten'),
+                    React.createElement('div', { 
+                        key: 'info3'
+                    }, '✏️ Rechtsklick auf FREMDE Nachrichten = Optional lokal bearbeiten')
+                ]),
+
+                // Antworten-Einstellungen
+                React.createElement('div', {
+                    style: { 
+                        background: '#2f3136', 
+                        padding: '16px', 
+                        borderRadius: '6px', 
+                        marginBottom: '16px' 
+                    }
+                }, [
+                    React.createElement('h3', {
+                        key: 'reply-title',
+                        style: { color: '#fff', marginTop: '0', marginBottom: '12px', fontSize: '16px' }
+                    }, '💬 Antworten auf fremde Nachrichten'),
+                    
+                    React.createElement(this.UIModule.FormSwitch, {
+                        key: 'reply-switch',
+                        value: settings.doubleClickToReply,
+                        note: "Doppelklick auf fremde Nachrichten zum Antworten",
+                        onChange: handleSwitch("doubleClickToReply")
+                    }, "Doppelklick-Antworten aktivieren"),
+                    
+                    React.createElement(this.UIModule.FormSwitch, {
+                        key: 'reply-mod-switch',
+                        disabled: !settings.doubleClickToReply,
+                        value: settings.doubleClickToReplyModifier,
+                        note: "Antworten nur mit Modifikator-Taste",
+                        onChange: handleSwitch("doubleClickToReplyModifier")
+                    }, "Modifikator erforderlich"),
+                    
+                    React.createElement(this.UIModule.FormItem, {
+                        key: 'reply-mod-item',
+                        disabled: !settings.doubleClickToReply || !settings.doubleClickToReplyModifier,
+                        title: "Modifikator-Taste für Antworten"
+                    }, React.createElement(this.UIModule.RadioGroup, {
+                        disabled: !settings.doubleClickToReply || !settings.doubleClickToReplyModifier,
+                        value: settings.replyModifier,
+                        options: [
+                            { name: "Shift", value: "shift" },
+                            { name: "Ctrl", value: "ctrl" },
+                            { name: "Alt", value: "alt" }
+                        ],
+                        onChange: handleRadio("replyModifier")
+                    }))
+                ]),
+
+                // Lokale Bearbeitung-Einstellungen
+                React.createElement('div', {
+                    style: { 
+                        background: '#2f3136', 
+                        padding: '16px', 
+                        borderRadius: '6px', 
+                        marginBottom: '16px' 
+                    }
+                }, [
+                    React.createElement('h3', {
+                        key: 'edit-title',
+                        style: { color: '#fff', marginTop: '0', marginBottom: '12px', fontSize: '16px' }
+                    }, '✏️ Lokale Bearbeitung fremder Nachrichten'),
+                    
+                    React.createElement(this.UIModule.FormSwitch, {
+                        key: 'edit-switch',
+                        value: settings.enableRightClickEdit,
+                        note: "Rechtsklick auf fremde Nachrichten zum lokalen Bearbeiten",
+                        onChange: handleSwitch("enableRightClickEdit")
+                    }, "Rechtsklick-Bearbeitung aktivieren"),
+                    
+                    React.createElement(this.UIModule.FormSwitch, {
+                        key: 'edit-mod-switch',
+                        disabled: !settings.enableRightClickEdit,
+                        value: settings.rightClickEditModifier,
+                        note: "Lokale Bearbeitung nur mit Modifikator-Taste",
+                        onChange: handleSwitch("rightClickEditModifier")
+                    }, "Modifikator erforderlich"),
+                    
+                    React.createElement(this.UIModule.FormItem, {
+                        key: 'edit-mod-item',
+                        disabled: !settings.enableRightClickEdit || !settings.rightClickEditModifier,
+                        title: "Modifikator-Taste für lokale Bearbeitung"
+                    }, React.createElement(this.UIModule.RadioGroup, {
+                        disabled: !settings.enableRightClickEdit || !settings.rightClickEditModifier,
+                        value: settings.rightClickModifier,
+                        options: [
+                            { name: "Shift", value: "shift" },
+                            { name: "Ctrl", value: "ctrl" },
+                            { name: "Alt", value: "alt" }
+                        ],
+                        onChange: handleRadio("rightClickModifier")
+                    }))
+                ]),
+                
+                // Lokale Bearbeitungen verwalten
                 React.createElement("button", {
                     onClick: () => {
                         this.localEdits.clear();
@@ -328,9 +480,10 @@ module.exports = class EnhancedDoubleClickEdit {
                     },
                     style: {
                         background: "#ed4245", color: "#fff", border: "none",
-                        padding: "8px 16px", borderRadius: "4px", cursor: "pointer", marginTop: "15px"
+                        padding: "12px 20px", borderRadius: "6px", cursor: "pointer", 
+                        fontSize: "14px", fontWeight: "600"
                     }
-                }, "Alle lokalen Bearbeitungen löschen")
+                }, "🗑️ Alle lokalen Bearbeitungen löschen")
             );
         };
     }
